@@ -25,7 +25,7 @@ env:
   RUN_FOR_SECONDS: "19800"
   # Tên file workflow này (để bước download artifact biết tìm đúng workflow).
   # Nếu bạn đổi tên file, nhớ đổi biến này cho khớp.
-  WORKFLOW_FILE_NAME: "nexus-duo.yml"
+  WORKFLOW_FILE_NAME: "t1.yml"
 
 jobs:
   nexus:
