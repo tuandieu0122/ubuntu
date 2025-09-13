@@ -2,42 +2,37 @@ name: Nexus CLI (2 nodes, persist state)
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_ssh:
+        description: "Open tmate SSH session for this run?"
+        required: false
+        default: "false"
   schedule:
-    # Chạy mỗi 5 giờ để kịp backup trước giới hạn 6h của runner
     - cron: "0 */5 * * *"
 
 permissions:
   contents: read
   actions: read
 
-# Ngăn trùng lặp nhiều run đè nhau (chỉ 1 run hoạt động tại 1 thời điểm)
 concurrency:
   group: nexus-duo-singleton
   cancel-in-progress: false
 
 env:
-  # 👉 DÁN 2 NODE ID CỦA BẠN VÀO ĐÂY
-  NODE_ID_1: "36063227"
-  NODE_ID_2: "36052788"
-  # Có thể chỉnh difficulty cho nhẹ máy runner của GitHub (2 vCPU/7GB RAM)
+  NODE_ID_1: "36052788"
+  NODE_ID_2: "36063227"
   MAX_DIFFICULTY: "small_medium"
-  # Thời lượng chạy trước khi dừng để backup (giây) ~ 5h30m
   RUN_FOR_SECONDS: "19800"
-  # Tên file workflow này (để bước download artifact biết tìm đúng workflow).
-  # Nếu bạn đổi tên file, nhớ đổi biến này cho khớp.
   WORKFLOW_FILE_NAME: "t1.yml"
 
 jobs:
   nexus:
     runs-on: ubuntu-latest
-    # 355 phút < 6h để chắc chắn job không bị kill trước khi upload artifact
     timeout-minutes: 355
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Tải state cũ (nếu có) từ artifact của các lần chạy trước
       - name: Download previous state artifact
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -53,8 +48,6 @@ jobs:
           fi
           mkdir -p "$HOME/.nexus"
 
-      # 2) Cài Nexus CLI (non-interactive)
-      #    Theo hướng dẫn Quick Install / Non-Interactive từ docs/README của Nexus
       - name: Install Nexus CLI
         run: |
           set -euxo pipefail
@@ -63,26 +56,18 @@ jobs:
           NONINTERACTIVE=1 ./install.sh
           nexus-cli --version || true
 
-      # 3) Kiểm tra đã dán Node ID chưa
       - name: Validate Node IDs
         run: |
           set -euxo pipefail
-          if [ "${NODE_ID_1}" = "PASTE_ID_1" ] || [ -z "${NODE_ID_1}" ]; then
-            echo "❌ Bạn chưa dán NODE_ID_1 vào env."; exit 1; fi
-          if [ "${NODE_ID_2}" = "PASTE_ID_2" ] || [ -z "${NODE_ID_2}" ]; then
-            echo "❌ Bạn chưa dán NODE_ID_2 vào env."; exit 1; fi
+          [ "${NODE_ID_1}" != "PASTE_ID_1" ] && [ -n "${NODE_ID_1}" ] || { echo "❌ Chưa dán NODE_ID_1"; exit 1; }
+          [ "${NODE_ID_2}" != "PASTE_ID_2" ] && [ -n "${NODE_ID_2}" ] || { echo "❌ Chưa dán NODE_ID_2"; exit 1; }
 
-      # 4) Cài công cụ hỗ trợ (tmux, taskset)
       - name: Install helpers (tmux, util-linux)
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y tmux util-linux psmisc
 
-      # 5) Khởi động 2 node trong 2 phiên tmux riêng
-      #    Mẹo: ghi config.json cho NODE_ID_1 -> start node1
-      #         sau đó ghi lại config.json cho NODE_ID_2 -> start node2
-      #    Cả 2 tiến trình sẽ giữ node_id đã đọc khi khởi động
       - name: Start 2 Nexus nodes (tmux)
         env:
           N1: ${{ env.NODE_ID_1 }}
@@ -90,22 +75,37 @@ jobs:
           MAXDIFF: ${{ env.MAX_DIFFICULTY }}
         run: |
           set -euxo pipefail
-
-          tmux -V
-
-          # Node 1
           printf '{\n  "node_id": "%s"\n}\n' "$N1" > "$HOME/.nexus/config.json"
           tmux new -s nexus1 -d "taskset -c 0 nexus-cli start --headless --max-difficulty ${MAXDIFF} --node-id ${N1}"
-
-          # Node 2
           sleep 3
           printf '{\n  "node_id": "%s"\n}\n' "$N2" > "$HOME/.nexus/config.json"
           tmux new -s nexus2 -d "taskset -c 1 nexus-cli start --headless --max-difficulty ${MAXDIFF} --node-id ${N2}"
-
-          # Hiển thị danh sách session để log
           tmux ls || true
 
-      # 6) Đợi ~5h30m rồi dừng để backup state (an toàn trước mốc 6h)
+      # === OPTIONAL: mở SSH qua tmate khi bạn chạy thủ công và bật enable_ssh ===
+      - name: Open SSH (tmate)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == 'true' }}
+        id: tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+      - name: Save SSH endpoints (artifact)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == 'true' }}
+        run: |
+          set -eux
+          echo "${{ steps.tmate.outputs.ssh }}" > ssh.txt || true
+          echo "${{ steps.tmate.outputs.web }}" >> ssh.txt || true
+
+      - name: Upload SSH endpoints
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh
+          path: ssh.txt
+          retention-days: 3
+
+      # === Tiếp tục chạy ~5h30m rồi backup state ===
       - name: Keep running then stop for backup
         env:
           RUN_FOR_SECONDS: ${{ env.RUN_FOR_SECONDS }}
@@ -117,18 +117,14 @@ jobs:
             tmux has-session -t nexus2 2>/dev/null || break
             sleep 60
           done
-
-          # Tắt nhẹ nhàng
           tmux kill-session -t nexus1 || true
           tmux kill-session -t nexus2 || true
           pkill -f 'nexus-cli start' || true
           sleep 2
 
-      # 7) Lưu log ngắn gọn (tuỳ chọn) để bạn xem cho dễ
       - name: Save last logs
         run: |
           set -eux
-          # Thu log nếu còn pane (không bắt buộc)
           tmux capture-pane -pt nexus1 2>/dev/null | tail -n 200 > nexus1.log || true
           tmux capture-pane -pt nexus2 2>/dev/null | tail -n 200 > nexus2.log || true
 
@@ -142,13 +138,10 @@ jobs:
             nexus2.log
           retention-days: 7
 
-      # 8) Đóng gói state để lần sau tải lại chạy tiếp với cùng 2 ID
       - name: Pack state
         run: |
           set -euxo pipefail
-          # Lưu toàn bộ ~/.nexus (bao gồm config/credentials) để lần sau tự chạy lại
           tar --zstd -cf nexus-state.tar.zst -C "$HOME" .nexus || true
-          ls -lah nexus-state.tar.zst || true
 
       - name: Upload state artifact
         uses: actions/upload-artifact@v4
